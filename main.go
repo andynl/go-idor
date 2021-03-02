@@ -56,7 +56,7 @@ func main() {
 		fmt.Println(err)
 	}
 
-	getPhones()
+	saveBorrower()
 }
 
 func connectMongo() (*mongo.Database, error) {
@@ -86,30 +86,7 @@ func connectSql() (*sql.DB, error) {
 	return db, nil
 }
 
-func insert() {
-	resp, err := getBorrowerProfileAndInsertToDB()
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	db, err := connectMongo()
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	if err := json.Unmarshal(resp, &doc); err != nil {
-		log.Fatal(err)
-	}
-
-	_, err = db.Collection("borrower").InsertOne(ctx, doc)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Println("success")
-}
-
-func getPhones() {
+func saveBorrower() {
 	// ambil data user_id dari sql
 	// select user_id from user where is_saved = 'false'
 	db, err := connectSql()
@@ -119,7 +96,7 @@ func getPhones() {
 	}
 	defer db.Close()
 
-	results, err := db.Query("select count(*) from user")
+	results, err := db.Query("select * from user")
 	if err != nil {
 		fmt.Println(err.Error())
 		return
@@ -133,15 +110,34 @@ func getPhones() {
 			panic(err.Error())
 		}
 
-		fmt.Println(phone.UserID)
+		resp, err := getBorrowerProfile(phone.UserID)
+		if err != nil {
+			log.Fatalln(err)
+		}
+
+		db, err := connectMongo()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		if err := json.Unmarshal(resp, &doc); err != nil {
+			log.Fatal(err)
+		}
+
+		_, err = db.Collection("borrower").InsertOne(ctx, doc)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		fmt.Println("success")
 	}
 
 	defer results.Close()
 }
 
-func getBorrowerProfileAndInsertToDB() ([]byte, error) {
+func getBorrowerProfile(id string) ([]byte, error) {
 	// iterate api borrower profile sesuai dengan user_id get phones dan simpan data ke database
-	url, err := url.Parse(baseAPIURL + "/profile/" + "4d870d79-8bb4-49b0-afac-7f291bd8f5e5" + "/borrower-profile")
+	url, err := url.Parse(baseAPIURL + "/profile/" + id + "/borrower-profile")
 
 	if err != nil {
 		return nil, err

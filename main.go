@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -20,6 +22,9 @@ const (
 	baseAPIURL       = "https://api.finanku.com:3000/v1/api"
 	token            = "ZwMdi7iMoMJimLoM6sFaR1Ed2mzHkkAR7c9dB1AINS8LGS35pySwKo1N2NQNbC0J"
 	defaultUserAgent = ""
+	dbMaxIdleConns   = 4
+	dbMaxConns       = 100
+	totalWorker      = 100
 )
 
 var defaultHeader = http.Header{
@@ -32,6 +37,8 @@ var defaultHeader = http.Header{
 var ctx = context.Background()
 
 var doc interface{}
+
+var dataHeaders = make([]string, 0)
 
 type Phones struct {
 	UserID string `json:"user_id"`
@@ -46,17 +53,27 @@ func main() {
 
 	// insert()
 
-	db, err := connectSql()
+	db, err := openDbConnectionMysql()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	err = db.Ping()
+	mongo, err := connectMongo()
 	if err != nil {
-		fmt.Println(err)
+		log.Fatal(err)
 	}
 
-	saveBorrower()
+	jobs := make(chan []interface{}, 0)
+	wg := new(sync.WaitGroup)
+
+	go dispatchWorkers(mongo, jobs, wg)
+	readDataPhonesFromMysql(db, jobs, wg)
+
+	wg.Wait()
+
+	duration := time.Since(start)
+	fmt.Println("done in", int(math.Ceil(duration.Seconds())), "seconds")
+
 }
 
 func connectMongo() (*mongo.Database, error) {
@@ -77,62 +94,51 @@ func connectMongo() (*mongo.Database, error) {
 	return client.Database(dbName), nil
 }
 
-func connectSql() (*sql.DB, error) {
+func openDbConnectionMysql() (*sql.DB, error) {
+	log.Println("=> open db connection MySQL")
 	db, err := sql.Open("mysql", "root:inipassword@tcp(127.0.0.1:3306)/finanku")
 	if err != nil {
 		return nil, err
 	}
 
+	db.SetMaxOpenConns(dbMaxConns)
+	db.SetMaxIdleConns(dbMaxIdleConns)
+
 	return db, nil
 }
 
-func saveBorrower() {
-	// ambil data user_id dari sql
-	// select user_id from user where is_saved = 'false'
-	db, err := connectSql()
-	if err != nil {
-		fmt.Println(err.Error())
-		return
+func readDataPhonesFromMysql(db *sql.DB, jobs chan<- []interface{}, wg *sync.WaitGroup) {
+	for {
+		results, err := db.Query("select * from user")
+		if err != nil {
+			fmt.Println(err.Error())
+			return
+		}
+  k 7
+		for results.Next() {
+			var phone Phones
+
+			err = results.Scan(&phone.UserID)
+			if err != nil {
+				break
+			}
+
+			if len(dataHeaders) == 0 {
+				dataHeaders = results
+				continue
+			}
+
+			rowOrdered := make([]interface{}, 0)
+			for _, each := range results {
+				rowOrdered = append(rowOrdered, each)
+			}
+
+			wg.Add(1)
+			jobs <- rowOrdered
+		}
+		defer results.Close()
+		defer close(jobs)
 	}
-	defer db.Close()
-
-	results, err := db.Query("select * from user")
-	if err != nil {
-		fmt.Println(err.Error())
-		return
-	}
-
-	for results.Next() {
-		var phone Phones
-
-		err = results.Scan(&phone.UserID)
-		if err != nil {
-			panic(err.Error())
-		}
-
-		resp, err := getBorrowerProfile(phone.UserID)
-		if err != nil {
-			log.Fatalln(err)
-		}
-
-		db, err := connectMongo()
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		if err := json.Unmarshal(resp, &doc); err != nil {
-			log.Fatal(err)
-		}
-
-		_, err = db.Collection("borrower").InsertOne(ctx, doc)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		fmt.Println("success")
-	}
-
-	defer results.Close()
 }
 
 func getBorrowerProfile(id string) ([]byte, error) {
@@ -165,4 +171,54 @@ func getBorrowerProfile(id string) ([]byte, error) {
 	}
 
 	return respBody, nil
+}
+
+func dispatchWorkers(db *mongo.Database, jobs <-chan []interface{}, wg *sync.WaitGroup) {
+	for workerIndex := 0; workerIndex <= totalWorker; workerIndex++ {
+		go func(workerIndex int, db *mongo.Database, jobs <-chan []interface{}, wg *sync.WaitGroup) {
+			counter := 0
+
+			for job := range jobs {
+				doTheJob(workerIndex, counter, db, job)
+				wg.Done()
+				counter++
+			}
+		}(workerIndex, db, jobs, wg)
+	}
+}
+
+func doTheJob(workerIndex, counter int, db *mongo.Database, values []interface{}) {
+	for {
+		var outerError error
+		func(outerError *error) {
+			defer func() {
+				if err := recover(); err != nil {
+					*outerError = fmt.Errorf("%v", err)
+				}
+			}()
+
+			// resp, err := getBorrowerProfile(values)
+
+			db, err := connectMongo()
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			if err := json.Unmarshal(values, &doc); err != nil {
+				log.Fatal(err)
+			}
+
+			_, err = db.Collection("borrower").InsertOne(ctx, doc)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+		}(&outerError)
+		if outerError == nil {
+			break
+		}
+	}
+	if counter%100 == 0 {
+		log.Println("=> worker", workerIndex, "inserted", counter, "data")
+	}
 }

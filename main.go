@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -20,7 +19,7 @@ import (
 
 const (
 	baseAPIURL       = "https://api.finanku.com:3000/v1/api"
-	token            = "ZwMdi7iMoMJimLoM6sFaR1Ed2mzHkkAR7c9dB1AINS8LGS35pySwKo1N2NQNbC0J"
+	token            = "kTsGkTyfmxP2B9GzL70WekNlumJPNXZfNMaV6CDEAgkpeX9SftxbnBbQXgnEnDH0"
 	defaultUserAgent = ""
 	dbMaxIdleConns   = 4
 	dbMaxConns       = 100
@@ -40,8 +39,9 @@ var doc interface{}
 
 var dataHeaders = make([]string, 0)
 
-type Phones struct {
+type User struct {
 	UserID string `json:"user_id"`
+	Status string `json:"status"`
 }
 
 func main() {
@@ -52,22 +52,19 @@ func main() {
 	// fmt.Printf("%s\n", resp)
 
 	// insert()
-
-	db, err := openDbConnectionMysql()
-	if err != nil {
-		log.Fatal(err)
-	}
+	ctx := context.Background()
+	db := openDbConnection()
+	// log.Println(getBorrowerProfile("5c219643-454e-469f-b06b-d68e24d9545e"))
+	jobs := make(chan []interface{}, 1)
+	wg := new(sync.WaitGroup)
 
 	mongo, err := connectMongo()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	jobs := make(chan []interface{}, 0)
-	wg := new(sync.WaitGroup)
-
 	go dispatchWorkers(mongo, jobs, wg)
-	readDataPhonesFromMysql(db, jobs, wg)
+	readData(ctx, db, jobs, wg)
 
 	wg.Wait()
 
@@ -94,51 +91,17 @@ func connectMongo() (*mongo.Database, error) {
 	return client.Database(dbName), nil
 }
 
-func openDbConnectionMysql() (*sql.DB, error) {
+func openDbConnection() *sql.DB {
 	log.Println("=> open db connection MySQL")
-	db, err := sql.Open("mysql", "root:inipassword@tcp(127.0.0.1:3306)/finanku")
+	db, err := sql.Open("mysql", "root:@tcp(127.0.0.1:3307)/finanku")
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 
 	db.SetMaxOpenConns(dbMaxConns)
 	db.SetMaxIdleConns(dbMaxIdleConns)
 
-	return db, nil
-}
-
-func readDataPhonesFromMysql(db *sql.DB, jobs chan<- []interface{}, wg *sync.WaitGroup) {
-	for {
-		results, err := db.Query("select * from user")
-		if err != nil {
-			fmt.Println(err.Error())
-			return
-		}
-  k 7
-		for results.Next() {
-			var phone Phones
-
-			err = results.Scan(&phone.UserID)
-			if err != nil {
-				break
-			}
-
-			if len(dataHeaders) == 0 {
-				dataHeaders = results
-				continue
-			}
-
-			rowOrdered := make([]interface{}, 0)
-			for _, each := range results {
-				rowOrdered = append(rowOrdered, each)
-			}
-
-			wg.Add(1)
-			jobs <- rowOrdered
-		}
-		defer results.Close()
-		defer close(jobs)
-	}
+	return db
 }
 
 func getBorrowerProfile(id string) ([]byte, error) {
@@ -175,12 +138,12 @@ func getBorrowerProfile(id string) ([]byte, error) {
 
 func dispatchWorkers(db *mongo.Database, jobs <-chan []interface{}, wg *sync.WaitGroup) {
 	for workerIndex := 0; workerIndex <= totalWorker; workerIndex++ {
+
 		go func(workerIndex int, db *mongo.Database, jobs <-chan []interface{}, wg *sync.WaitGroup) {
 			counter := 0
-
 			for job := range jobs {
 				doTheJob(workerIndex, counter, db, job)
-				wg.Done()
+				defer wg.Done()
 				counter++
 			}
 		}(workerIndex, db, jobs, wg)
@@ -199,18 +162,13 @@ func doTheJob(workerIndex, counter int, db *mongo.Database, values []interface{}
 
 			// resp, err := getBorrowerProfile(values)
 
-			db, err := connectMongo()
+			// if err := json.Unmarshal(values, &doc); err != nil {
+			// 	log.Fatal(err)
+			// }
+			// log.Println(values)
+			_, err := db.Collection("borrower").InsertOne(ctx, values)
 			if err != nil {
-				log.Fatal(err)
-			}
-
-			if err := json.Unmarshal(values, &doc); err != nil {
-				log.Fatal(err)
-			}
-
-			_, err = db.Collection("borrower").InsertOne(ctx, doc)
-			if err != nil {
-				log.Fatal(err)
+				panic(err)
 			}
 
 		}(&outerError)
@@ -221,4 +179,36 @@ func doTheJob(workerIndex, counter int, db *mongo.Database, values []interface{}
 	if counter%100 == 0 {
 		log.Println("=> worker", workerIndex, "inserted", counter, "data")
 	}
+}
+
+func readData(ctx context.Context, db *sql.DB, jobs chan<- []interface{}, wg *sync.WaitGroup) {
+	defer db.Close()
+
+	query := "SELECT user_id, status FROM users LIMIT 10"
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		panic(err)
+	}
+	defer rows.Close()
+
+	var users []User
+	for rows.Next() {
+		var user User
+		err = rows.Scan(&user.UserID, &user.Status)
+		if err != nil {
+			panic(err)
+		}
+
+		users = append(users, user)
+	}
+
+	rowOrdered := make([]interface{}, 0)
+	for _, each := range users {
+		rowOrdered = append(rowOrdered, each)
+	}
+
+	wg.Add(1)
+	jobs <- rowOrdered
+
+	close(jobs)
 }
